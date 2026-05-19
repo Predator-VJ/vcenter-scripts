@@ -21,25 +21,46 @@ param (
     [Parameter(Mandatory = $true)]
     [System.Management.Automation.PSCredential]$Credential,
 
+    [ValidateRange(1, 100)]
     [int]$WarningThresholdPercent = 80
 )
 
 Import-Module VMware.PowerCLI -ErrorAction Stop
-Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
+# Use Session scope so we don't permanently change the user's PowerCLI config.
+Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Scope Session -Confirm:$false | Out-Null
 
 try {
     Connect-VIServer -Server $vCenterServer -Credential $Credential -ErrorAction Stop
     Write-Host "Gathering datastore capacity data..." -ForegroundColor Cyan
 
-    $datastores = Get-Datastore | Select-Object Name,
-        @{N='CapacityGB';E={[math]::Round($_.CapacityGB,2)}},
-        @{N='FreeSpaceGB';E={[math]::Round($_.FreeSpaceGB,2)}},
-        @{N='UsedSpaceGB';E={[math]::Round(($_.CapacityGB - $_.FreeSpaceGB),2)}},
-        @{N='UsedPercent';E={[math]::Round((($_.CapacityGB - $_.FreeSpaceGB) / $_.CapacityGB) * 100, 1)}},
-        Type, State
+    $datastores = Get-Datastore | ForEach-Object {
+        $capacity  = [double]$_.CapacityGB
+        $freeSpace = [double]$_.FreeSpaceGB
+
+        # Guard against division-by-zero for inaccessible/unmounted datastores.
+        $usedPercent = if ($capacity -gt 0) {
+            [math]::Round((($capacity - $freeSpace) / $capacity) * 100, 1)
+        } else {
+            $null
+        }
+
+        [PSCustomObject]@{
+            Name        = $_.Name
+            CapacityGB  = [math]::Round($capacity, 2)
+            FreeSpaceGB = [math]::Round($freeSpace, 2)
+            UsedSpaceGB = [math]::Round(($capacity - $freeSpace), 2)
+            UsedPercent = $usedPercent
+            Type        = $_.Type
+            State       = $_.State
+            Accessible  = $_.ExtensionData.Summary.Accessible
+        }
+    }
 
     foreach ($ds in $datastores) {
-        if ($ds.UsedPercent -ge $WarningThresholdPercent) {
+        if ($null -eq $ds.UsedPercent) {
+            Write-Host "[SKIP] $($ds.Name): capacity unknown (Accessible=$($ds.Accessible))" -ForegroundColor DarkYellow
+        }
+        elseif ($ds.UsedPercent -ge $WarningThresholdPercent) {
             Write-Host "[WARNING] $($ds.Name): $($ds.UsedPercent)% used ($($ds.FreeSpaceGB) GB free)" -ForegroundColor Red
         } else {
             Write-Host "[OK] $($ds.Name): $($ds.UsedPercent)% used ($($ds.FreeSpaceGB) GB free)" -ForegroundColor Green
